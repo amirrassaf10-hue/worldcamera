@@ -1,0 +1,210 @@
+
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>FaceCall 1</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;font-family:Arial,sans-serif}
+#remote{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;background:#111}
+#local{position:fixed;right:16px;bottom:16px;width:240px;height:150px;object-fit:cover;background:#222;border:2px solid #fff;border-radius:16px;z-index:5;box-shadow:0 8px 28px #000b;transform:scaleX(-1)}
+#panel{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:10;width:min(92vw,430px);padding:12px;background:#111d;color:#fff;border-radius:16px;backdrop-filter:blur(12px)}
+.row{display:flex;gap:8px}
+input,button{border:0;border-radius:11px;padding:12px;font-size:15px}
+input{flex:1;min-width:0}
+button{font-weight:bold;cursor:pointer}
+#status{text-align:center;font-size:13px;margin-top:8px;color:#ddd}
+#mute{position:fixed;right:16px;bottom:178px;width:48px;height:48px;border-radius:50%;z-index:6;padding:0}
+@media(max-width:600px){
+#local{width:34vw;height:auto;aspect-ratio:16/10;right:10px;bottom:10px;border-radius:13px}
+#mute{right:10px;bottom:calc(10px + 34vw*.625 + 10px)}
+.row{flex-direction:column}
+}
+</style>
+</head>
+<body>
+<video id="remote" autoplay playsinline></video>
+<video id="local" autoplay playsinline muted></video>
+
+<div id="panel">
+ <div class="row">
+  <input id="room" value="123456" placeholder="کد اتاق">
+  <button id="call">شروع تماس</button>
+ </div>
+ <div id="status">کد اتاق را وارد کن.</div>
+</div>
+
+<button id="mute">🎙️</button>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket=io({transports:["websocket","polling"]});
+const roomInput=document.getElementById("room");
+const callBtn=document.getElementById("call");
+const statusBox=document.getElementById("status");
+const localVideo=document.getElementById("local");
+const remoteVideo=document.getElementById("remote");
+const muteBtn=document.getElementById("mute");
+
+let room="";
+let stream=null;
+let pc=null;
+let started=false;
+let remoteReady=false;
+let candidates=[];
+
+function status(t){statusBox.textContent=t}
+
+function makeConnection(){
+ pc=new RTCPeerConnection({
+   iceServers:[
+     {urls:"stun:stun.l.google.com:19302"},
+     {urls:"stun:stun1.l.google.com:19302"}
+   ]
+ });
+
+ pc.onicecandidate=e=>{
+   if(e.candidate){
+     socket.emit("signal",{
+       room,
+       data:{type:"candidate",candidate:e.candidate}
+     });
+   }
+ };
+
+ pc.ontrack=e=>{
+   if(e.streams && e.streams[0]){
+     remoteVideo.srcObject=e.streams[0];
+     remoteReady=true;
+     remoteVideo.play().catch(()=>{});
+   }
+ };
+
+ pc.onconnectionstatechange=()=>{
+   const s=pc.connectionState;
+   if(s==="connected") status("تماس متصل شد ✓");
+   else if(s==="connecting") status("در حال اتصال...");
+   else if(s==="disconnected") status("ارتباط قطع شد.");
+   else if(s==="failed") status("اتصال ناموفق بود؛ دوباره تلاش کن.");
+ };
+
+ stream.getTracks().forEach(t=>pc.addTrack(t,stream));
+}
+
+async function addQueued(){
+ if(!pc.remoteDescription)return;
+ while(candidates.length){
+   try{await pc.addIceCandidate(candidates.shift())}
+   catch(e){console.log(e)}
+ }
+}
+
+callBtn.onclick=async()=>{
+ if(started)return;
+
+ room=roomInput.value.trim();
+ if(!room){status("کد اتاق را وارد کن.");return}
+ if(!window.isSecureContext){status("این صفحه باید با HTTPS باز شود.");return}
+ if(!navigator.mediaDevices){status("مرورگر اجازه دوربین را نمی‌دهد.");return}
+
+ try{
+   status("در حال فعال کردن دوربین و میکروفون...");
+   stream=await navigator.mediaDevices.getUserMedia({
+     video:{facingMode:"user"},
+     audio:true
+   });
+
+   localVideo.srcObject=stream;
+   await localVideo.play().catch(()=>{});
+
+   makeConnection();
+   started=true;
+   callBtn.disabled=true;
+   roomInput.disabled=true;
+
+   status("وارد اتاق شدی؛ منتظر نفر دوم...");
+   socket.emit("join",room);
+ }catch(e){
+   console.error(e);
+   status("دسترسی دوربین یا میکروفون رد شد.");
+ }
+};
+
+socket.on("peer-joined",async()=>{
+ if(!started || !pc)return;
+
+ try{
+   status("طرف مقابل پیدا شد؛ در حال اتصال...");
+
+   const offer=await pc.createOffer({
+     offerToReceiveAudio:true,
+     offerToReceiveVideo:true
+   });
+
+   await pc.setLocalDescription(offer);
+
+   socket.emit("signal",{
+     room,
+     data:{
+       type:"offer",
+       sdp:pc.localDescription
+     }
+   });
+ }catch(e){console.error(e)}
+});
+
+socket.on("signal",async data=>{
+ if(!started || !pc || !data)return;
+
+ try{
+   if(data.type==="offer"){
+     await pc.setRemoteDescription(data.sdp);
+     await addQueued();
+
+     const answer=await pc.createAnswer();
+     await pc.setLocalDescription(answer);
+
+     socket.emit("signal",{
+       room,
+       data:{
+         type:"answer",
+         sdp:pc.localDescription
+       }
+     });
+
+   }else if(data.type==="answer"){
+     await pc.setRemoteDescription(data.sdp);
+     await addQueued();
+
+   }else if(data.type==="candidate"){
+     if(pc.remoteDescription){
+       await pc.addIceCandidate(data.candidate);
+     }else{
+       candidates.push(data.candidate);
+     }
+   }
+ }catch(e){
+   console.error("WebRTC:",e);
+ }
+});
+
+muteBtn.onclick=()=>{
+ if(!stream)return;
+ const audio=stream.getAudioTracks()[0];
+ if(!audio)return;
+ audio.enabled=!audio.enabled;
+ muteBtn.textContent=audio.enabled?"🎙️":"🔇";
+};
+
+socket.on("connect",()=>{
+ if(started)status("اتصال به سرور برقرار شد.");
+});
+
+socket.on("disconnect",()=>{
+ if(started)status("ارتباط با سرور قطع شد.");
+});
+</script>
+</body>
+</html>
